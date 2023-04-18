@@ -56,6 +56,10 @@ logging.getLogger("paramiko").setLevel(os.getenv("EG_SSH_LOG_LEVEL", logging.WAR
 # Pop certain env variables that don't need to be logged, e.g. remote_pwd
 env_pop_list = ["EG_REMOTE_PWD", "LS_COLORS"]
 
+# Comma separated list of env variables that shouldn't be logged
+sensitive_env_keys = os.getenv("EG_SENSITIVE_ENV_KEYS", "").lower().split(",")
+redaction_mask = os.getenv("EG_REDACTION_MASK", "********")
+
 default_kernel_launch_timeout = float(os.getenv("EG_KERNEL_LAUNCH_TIMEOUT", "30"))
 max_poll_attempts = int(os.getenv("EG_MAX_POLL_ATTEMPTS", "10"))
 poll_interval = float(os.getenv("EG_POLL_INTERVAL", "0.5"))
@@ -226,9 +230,8 @@ class ResponseManager(SingletonConfigurable):
                     )
                     continue
                 else:
-                    raise RuntimeError(
-                        f"Failed to bind to port '{port}' for response address due to: '{e}'"
-                    )
+                    msg = f"Failed to bind to port '{port}' for response address due to: '{e}'"
+                    raise RuntimeError(msg) from e
             else:
                 response_port = port
                 break
@@ -316,9 +319,8 @@ class ResponseManager(SingletonConfigurable):
             # Get the version
             version = payload.get("version")
             if version is None:
-                raise ValueError(
-                    "Payload received from kernel does not include a version indicator!"
-                )
+                msg = "Payload received from kernel does not include a version indicator!"
+                raise ValueError(msg)
             self.log.debug(f"Version {version} payload received.")
 
             if version == 1:
@@ -333,13 +335,14 @@ class ResponseManager(SingletonConfigurable):
                 encrypted_connection_info = base64.b64decode(payload["conn_info"].encode())
                 connection_info_str = unpad(cipher.decrypt(encrypted_connection_info), 16).decode()
             else:
-                raise ValueError(f"Unexpected version indicator received: {version}!")
+                msg = f"Unexpected version indicator received: {version}!"
+                raise ValueError(msg)
         except Exception as ex:
             # Could be version "0", walk the registrant kernel-ids and attempt to decrypt using each as a key.
             # If none are found, re-raise the triggering exception.
             self.log.debug(f"decode_payload exception - {ex.__class__.__name__}: {ex}")
             connection_info_str = None
-            for kernel_id in self._response_registry.keys():
+            for kernel_id in self._response_registry:
                 aes_key = kernel_id[0:16]
                 try:
                     cipher = AES.new(aes_key.encode("utf-8"), AES.MODE_ECB)
@@ -459,10 +462,11 @@ class BaseProcessProxyABC(metaclass=abc.ABCMeta):
         self.remote_pwd = os.getenv("EG_REMOTE_PWD")
         self._use_gss_raw = os.getenv("EG_REMOTE_GSS_SSH", "False")
         if self._use_gss_raw.lower() not in ("", "true", "false"):
-            raise ValueError(
+            msg = (
                 "Invalid Value for EG_REMOTE_GSS_SSH expected one of "
                 '"", "True", "False", got {!r}'.format(self._use_gss_raw)
             )
+            raise ValueError(msg)
         self.use_gss = self._use_gss_raw == "true"
         if self.use_gss:
             if self.remote_pwd or _remote_user:
@@ -470,7 +474,8 @@ class BaseProcessProxyABC(metaclass=abc.ABCMeta):
                     "Both `EG_REMOTE_GSS_SSH` and one of `EG_REMOTE_PWD` or "
                     "`EG_REMOTE_USER` is set. "
                     "Those options are mutually exclusive, you configuration may be incorrect. "
-                    "EG_REMOTE_GSS_SSH will take priority."
+                    "EG_REMOTE_GSS_SSH will take priority.",
+                    stacklevel=2,
                 )
             self.remote_user = None
         else:
@@ -518,7 +523,15 @@ class BaseProcessProxyABC(metaclass=abc.ABCMeta):
 
         self._enforce_authorization(**kwargs)
 
-        self.log.debug("BaseProcessProxy.launch_process() env: {}".format(kwargs.get("env")))
+        # Filter sensitive values from being logged
+        env_copy = kwargs.get("env").copy()
+
+        if sensitive_env_keys:
+            for key in list(env_copy):
+                if any(phrase in key.lower() for phrase in sensitive_env_keys):
+                    env_copy[key] = redaction_mask
+
+        self.log.debug(f"BaseProcessProxy.launch_process() env: {env_copy}")
 
     def launch_kernel(
         self, cmd: list[str], **kwargs: dict[str, Any] | None
@@ -819,11 +832,8 @@ class BaseProcessProxyABC(metaclass=abc.ABCMeta):
             self._raise_authorization_error(kernel_username, "not authorized")
 
         # If authorized users are non-empty, ensure user is in that set.
-        if self.authorized_users.__len__() > 0:
-            if kernel_username not in self.authorized_users:
-                self._raise_authorization_error(
-                    kernel_username, "not in the set of users authorized"
-                )
+        if self.authorized_users.__len__() > 0 and kernel_username not in self.authorized_users:
+            self._raise_authorization_error(kernel_username, "not in the set of users authorized")
 
     def _raise_authorization_error(self, kernel_username: str, differentiator_clause: str) -> None:
         """
@@ -1037,7 +1047,7 @@ class LocalProcessProxy(BaseProcessProxyABC):
 
     async def launch_process(
         self, kernel_cmd: str, **kwargs: dict[str, Any] | None
-    ) -> type["LocalProcessProxy"]:
+    ) -> type[LocalProcessProxy]:
         """Launch a process for a kernel."""
         await super().launch_process(kernel_cmd, **kwargs)
 
@@ -1546,7 +1556,6 @@ class RemoteProcessProxy(BaseProcessProxyABC, metaclass=abc.ABCMeta):
         # using anything other than the socket-based signal (via signal_addr) will not work.
 
         if self.comm_port > 0:
-
             try:
                 self._send_listener_request({"signum": signum})
 
@@ -1577,7 +1586,7 @@ class RemoteProcessProxy(BaseProcessProxyABC, metaclass=abc.ABCMeta):
         # active, even after the kernel has terminated, leading to less than graceful terminations.
 
         if self.comm_port > 0:
-            shutdown_request = dict()
+            shutdown_request = {}
             shutdown_request["shutdown"] = 1
 
             try:

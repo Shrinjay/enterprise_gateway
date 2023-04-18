@@ -109,7 +109,8 @@ def new_kernel_id(**kwargs: dict[str, Any] | None) -> str:
         try:
             str_v4_kernel_id = str(uuid.UUID(str_kernel_id, version=4))
             if str_kernel_id != str_v4_kernel_id:  # Given string is not uuid v4 compliant
-                raise ValueError("value is not uuid v4 compliant")
+                msg = "value is not uuid v4 compliant"
+                raise ValueError(msg)
         except ValueError as ve:
             log.error(
                 "Invalid v4 UUID value detected in ['env']['KERNEL_ID']: '{}'!  Error: {}".format(
@@ -165,7 +166,6 @@ class RemoteMappingKernelManager(AsyncMappingKernelManager):
         """
         zmq_context = super()._context_default()
         if self.shared_context:  # this should be True by default
-
             # pyzmq currently does not expose defaults for these values, so we replicate them here
             # libzmq/zmq.h: ZMQ_MAX_SOCKETS_DLFT = 1023; zmq.Context.MAX_SOCKETS
             # libzmq/zmq.h: ZMQ_IO_THREADS_DFLT = 1; zmq.Context.IO_THREADS
@@ -190,10 +190,9 @@ class RemoteMappingKernelManager(AsyncMappingKernelManager):
 
     def check_kernel_id(self, kernel_id: str) -> None:
         """Check that a kernel_id exists and raise 404 if not."""
-        if kernel_id not in self:
-            if not self._refresh_kernel(kernel_id):
-                self.parent.kernel_session_manager.delete_session(kernel_id)
-                raise web.HTTPError(404, "Kernel does not exist: %s" % kernel_id)
+        if kernel_id not in self and not self._refresh_kernel(kernel_id):
+            self.parent.kernel_session_manager.delete_session(kernel_id)
+            raise web.HTTPError(404, "Kernel does not exist: %s" % kernel_id)
 
     def _refresh_kernel(self, kernel_id: str) -> bool:
         if self.parent.availability_mode == EnterpriseGatewayConfigMixin.AVAILABILITY_REPLICATION:
@@ -251,7 +250,7 @@ class RemoteMappingKernelManager(AsyncMappingKernelManager):
             await self.wait_for_restart_finish(kernel_id, "shutdown")
         try:
             await super().shutdown_kernel(kernel_id, now, restart)
-        except KeyError as ke:  # this is hit for multiple shutdown request.
+        except KeyError as ke:  # this is hint for multiple shutdown request.
             self.log.exception(f"Exception while shutting down kernel: '{kernel_id}': {ke}")
             raise web.HTTPError(404, "Kernel does not exist: %s" % kernel_id) from None
 
@@ -302,30 +301,33 @@ class RemoteMappingKernelManager(AsyncMappingKernelManager):
                     raise web.HTTPError(403, error_message)
 
             # Enforce per-user limit...
-            if self.parent.max_kernels_per_user >= 0:
-                if self.parent.kernel_session_manager:
-                    active_and_pending = (
-                        self.parent.kernel_session_manager.active_sessions(username) + pending_user
-                    )
-                    if active_and_pending >= self.parent.max_kernels_per_user:
-                        error_message = (
-                            "A max kernels per user limit has been set to {} and user '{}' "
-                            "currently has {} active and pending {}.".format(
-                                self.parent.max_kernels_per_user,
-                                username,
-                                active_and_pending,
-                                "kernel" if active_and_pending == 1 else "kernels",
-                            )
+            if self.parent.max_kernels_per_user >= 0 and self.parent.kernel_session_manager:
+                active_and_pending = (
+                    self.parent.kernel_session_manager.active_sessions(username) + pending_user
+                )
+                if active_and_pending >= self.parent.max_kernels_per_user:
+                    error_message = (
+                        "A max kernels per user limit has been set to {} and user '{}' "
+                        "currently has {} active and pending {}.".format(
+                            self.parent.max_kernels_per_user,
+                            username,
+                            active_and_pending,
+                            "kernel" if active_and_pending == 1 else "kernels",
                         )
-                        self.log.error(error_message)
-                        raise web.HTTPError(403, error_message)
+                    )
+                    self.log.error(error_message)
+                    raise web.HTTPError(403, error_message)
         return
 
     def remove_kernel(self, kernel_id: str) -> None:
         """
         Removes the kernel associated with `kernel_id` from the internal map and deletes the kernel session.
         """
-        super().remove_kernel(kernel_id)
+        try:
+            super().remove_kernel(kernel_id)
+        except KeyError:  # this is hint for multiple shutdown request.
+            self.log.debug(f"Exception while removing kernel {kernel_id}: kernel not found.")
+
         self.parent.kernel_session_manager.delete_session(kernel_id)
 
     def start_kernel_from_session(
@@ -605,15 +607,13 @@ class RemoteKernelManager(EnterpriseGatewayConfigMixin, AsyncIOLoopKernelManager
             Any options specified here will overwrite those used to launch the
             kernel.
         """
-        if now:  # if auto-restarting (when now is True), indicate we're restarting.
-            self.restarting = True
         kernel_id = self.kernel_id or os.path.basename(self.connection_file).replace(
             "kernel-", ""
         ).replace(".json", "")
         # Check if this is a remote process proxy and if now = True. If so, check its connection count. If no
         # connections, shutdown else perform the restart.  Note: auto-restart sets now=True, but handlers use
         # the default value (False).
-        if (
+        if (  # noqa
             isinstance(self.process_proxy, RemoteProcessProxy)
             and now
             and self.mapping_kernel_manager
@@ -626,6 +626,10 @@ class RemoteKernelManager(EnterpriseGatewayConfigMixin, AsyncIOLoopKernelManager
                 # Use the parent mapping kernel manager so activity monitoring and culling is also shutdown
                 await self.mapping_kernel_manager.shutdown_kernel(kernel_id, now=now)
                 return
+
+        if now:  # if auto-restarting (when now is True), indicate we're restarting.
+            self.restarting = True
+
         await super().restart_kernel(now, **kwargs)
         if isinstance(self.process_proxy, RemoteProcessProxy):  # for remote kernels...
             # Re-establish activity watching...
@@ -675,7 +679,8 @@ class RemoteKernelManager(EnterpriseGatewayConfigMixin, AsyncIOLoopKernelManager
             else:
                 self.kernel.send_signal(signum)
         else:
-            raise RuntimeError("Cannot signal kernel. No kernel is running!")
+            msg = "Cannot signal kernel. No kernel is running!"
+            raise RuntimeError(msg)
 
     def cleanup(self, connection_file: bool = True) -> None:
         """

@@ -7,7 +7,9 @@ import sys
 import urllib3
 import yaml
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from kubernetes import client, config
+from kubernetes import client
+
+from enterprise_gateway.services.processproxies.k8s_client import kubernetes_client
 
 urllib3.disable_warnings()
 
@@ -57,9 +59,8 @@ def launch_custom_resource_kernel(
     kernel_id, port_range, response_addr, public_key, spark_context_init_mode
 ):
     """Launch a custom resource kernel."""
-    config.load_incluster_config()
-
-    keywords = dict()
+    keywords = {}
+    keywords = {}
 
     keywords["eg_port_range"] = port_range
     keywords["eg_public_key"] = public_key
@@ -87,7 +88,7 @@ def launch_custom_resource_kernel(
         extend_operator_env(custom_resource_object, "executor")
 
     try:
-        client.CustomObjectsApi().create_namespaced_custom_object(
+        client.CustomObjectsApi(api_client=kubernetes_client).create_namespaced_custom_object(
             group, version, kernel_namespace, plural, custom_resource_object
         )
     except client.exceptions.ApiException as ex:
@@ -97,6 +98,9 @@ def launch_custom_resource_kernel(
                 "See 'https://github.com/GoogleCloudPlatform/spark-on-k8s-operator#installation' for "
                 "instructions, then retry the operation.\n"
             )
+        else:
+            print("ERROR processing Kubernetes Operator CRD - kernel launch terminating!")
+            print(custom_resource_yaml)
         raise ex
 
 
